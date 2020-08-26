@@ -1,0 +1,796 @@
+---
+title: "CRISPR/Cas9 TP53 mutants CAGE analysis"
+author: "Andrew T. Kwon"
+date: "August 24, 2020"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+
+```{r echo=FALSE}
+knitr::opts_chunk$set(cache  = TRUE)
+knitr::opts_knit$set(results='hide', warning=FALSE, error=FALSE, message=FALSE)
+ggplot2::theme_set(ggplot2::theme_bw())
+```
+
+
+# Overview
+
+This is the primary data processing and analysis of the nAnT-iCAGE data of the p53 CRISPR-Cas9 mutants of U87MG cell line. This notebook covers the initial data processing, quality control check, data normalization, differential expression analysis and functional analysis.
+
+## Background
+In order to test the efficacy of the various ADC designs, we need a reliable cell line model with mutated p53, as our target is its binding partner MDM2. We have created a number of CRISPR-Cas9 mutants of p53 from U87MG cells, from which we obtained transcriptome data using CAGE. In this analysis, we are examining how the p53 mutaiton affects the transcriptome, and whether there are any non-p53-related changes (off target effects from the mutation process etc.) that we need to be aware of. 
+
+# Data Pre-Processing
+
+## Library loading and parameter set up
+
+```{r environment_set}
+
+# Load the required libraries
+library(tidyverse)
+library(gridExtra)
+library(FactoMineR)
+library(edgeR)
+library(RColorBrewer)
+library(GenomicRanges)
+
+# set the relevant paths
+dirs <- list()
+
+dirs$base <- "~/Projects/Molecular_Network/ADC_Design/CRISPR_p53"
+dirs$box <- "~/Box Sync/Projects/Molecular_Network/CRISPR_p53"
+
+dirs$data <- file.path(dirs$base, "data")
+dirs$results <- file.path(dirs$box, 'results')
+dirs$plots <- file.path(dirs$results, "plots")
+
+# external data directories
+dirs$gencode <- file.path("~/Projects/Data/Gencode/annotation/homo_sapiens/gencode-27")
+dirs$fantom <- "~/Projects/FANTOM5/data/hg38"
+
+# min. log fold change
+minLogFC = 1
+
+# min. FDR thresholds
+maxFDR = 0.05
+```
+
+## Data loading
+
+There are 3 types of data we need to load:
+ * CAGE raw counts
+ * FANTOM5 promoterome CAGE DPI cluster information
+ * GENCODE annotation
+ 
+### CAGE raw counts
+
+The CAGE raw counts are stored in a pre-assembled counts table. From the column names, we need to extract the sample names and the barcodes associated with each sample.
+
+```{r rawcounts_loading}
+# load the expression table
+# usingl readr package, load as tibble
+rawcounts <- read_tsv(file.path(dirs$data, 'merged_rawcounts.tsv'))
+
+# let's shorten the names a bit, and make it more parseable
+colnames(rawcounts) <- gsub('CRISPR_p53.', '', colnames(rawcounts))
+colnames(rawcounts) <- gsub('.rawcounts', '', colnames(rawcounts))
+colnames(rawcounts) <- gsub('clone_', '', colnames(rawcounts))
+
+barcodes <- substr(colnames(rawcounts)[-c(1:5)], nchar(colnames(rawcounts)[-c(1:5)])-2, 100000)
+
+colnames(rawcounts)[-c(1:5)] <- substr(colnames(rawcounts)[-c(1:5)], 1, nchar(colnames(rawcounts)[-c(1:5)]) - 4)
+colnames(rawcounts)[-c(1:5)] <- gsub('e5_2-', 'c', colnames(rawcounts)[-c(1:5)])
+colnames(rawcounts)[-c(1:5)] <- gsub('-', '.', colnames(rawcounts)[-c(1:5)])
+colnames(rawcounts)[6:8] <- paste0(rep('WT_rep', 3), 1:3)
+
+names(barcodes) <- colnames(rawcounts)[-c(1:5)]
+
+```
+
+We can now set up the sample information table.
+
+Samples:
+
+ * wild type, c3.4, c4.2, c4.8, c5.11, c5.12, c5.5, c5.9
+ * 3 replicates each
+
+Libraries
+
+1. CNhi11076
+    + c5.11_rep1, c5.11_rep2, c5.11_rep3, c4.8_rep1, c4.8_rep2, c4.8_rep3, c4.2_rep1, c4.2_rep2
+    
+2. CNhi11077
+    + c4.2_rep3, c3.4_rep1, c3.4_rep2, c3.4_rep3, c5.5_rep1, c5.5_rep2, c5.5_rep3, c5.12_rep1
+    
+3. CNhi11078
+    + c5.12_rep2, c5.12_rep3, c5.9_rep1, c5.9_rep2, c5.9_rep3, wild_type_rep1, wild_type_rep2, wild_type_rep3
+
+```{r sample_info}
+# make sure the order is consistent with the counts table
+clones <- factor(c(rep('wild_type',3), rep('c3.4',3), rep('c4.2',3), rep('c4.8',3), rep('c5.11',3),
+                   rep('c5.12',3), rep('c5.5',3), rep('c5.9', 3)),
+                 levels=c('wild_type','c3.4','c4.2','c4.8','c5.5','c5.9','c5.11','c5.12'))
+names(clones) <- colnames(rawcounts)[-(1:5)]
+
+lib_ids <- factor(c(rep('CNhi11076',8), rep('CNhi11077',8), rep('CNhi11078',8)), levels=c('CNhi11076','CNhi11077','CNhi11078'))
+names(lib_ids) <- c(paste0('c5.11_rep', 1:3), paste0('c4.8_rep', 1:3), paste0('c4.2_rep', 1:3),
+                    paste0('c3.4_rep', 1:3), paste0('c5.5_rep', 1:3), paste0('c5.12_rep', 1:3),
+                    paste0('c5.9_rep', 1:3), paste0('WT_rep', 1:3))
+
+sample_info <- tibble(sample=names(clones),
+					  clone=clones,
+					  barcode=barcodes[names(clones)],
+					  library.id=lib_ids[names(clones)]
+					  )
+
+write_tsv(sample_info, file.path(dirs$results, "sample_info.tsv"))
+
+rm(barcodes, clones, lib_ids)
+```
+
+### Gencode V27 / hg38 Annotation Loading
+
+The FANTOM5 CAGE clusters need to be mapped to appropriate gene/transcript annotations. This RData object contains the GENCODE v27 annotations for each FANTOM5 DPI cluster, along with the location of FANTOM5 enhancers, and the DPI clusters that are located within them. Also, because many of these DPI clusters are too closely spaced together, we have merged all of those that are within 20 bp of each other. 
+
+* clusters.in.enhancers: table of CAGE DPI cluster ID's that overlap FANTOM5 enhancer annotations
+* annot.G27: original GENCODE annotations for FANTOM5 DPI clusters. See below for explanation of relevant column names.
+
+* Columns for 'annot_G27_full':
+ + clusterID: original FANTOM5 DPI cluster ID
+ + clusterName: originial FANTOM5 DPI cluster name, of the format pX@GENE, where X is the promoter number decided by the expression rank among all the promoters in this GENE
+ + chrom, start, end, strand: chromosomal coordinates
+ + mergedName, mergedStart, mergedEnd: new cluster name and coordinates assigned to the 20bp-merged CAGE clusters
+ + F5_tag_count: total expression recorded for this CAGE clutser in the FANTOM5 data
+ + type: enhancer | promoter
+ + mask, geneNum: unused
+ + trnscptIDStr, geneIDStr, geneNameStr, geneClassStr: GENCODE annotations
+ + Entrez_ID, HGNC_ID: Entrez and HGNC ID's, when available
+
+ 
+```{r F5_annot_loading}
+# note that this also has the unmerged annot.G27, which needs to be deleted
+load(file.path(dirs$gencode, "F5_CAGE_GENCODEv27_hg38_annotation.RData")) # contains the enhancer info
+annot_G27_full <- readRDS(file.path(dirs$gencode, "annot_G27_merged_full.rds")) 
+rm(annot.G27)
+```
+
+Based on the loaded annotations, we now need to merge the FANTOM5 DPI clusters that fall within the same enhancers and sum up their expression counts.
+
+```{r separate_enhancers}
+# separate rawcounts into promoter and enhancer peaks
+rawcounts_promoters <- anti_join(rawcounts[,-c(2:5)], clusters.in.enhancers, by=c("clusterID" = "promoterID"))
+
+rawcounts_enhancers <- inner_join(rawcounts[,-c(2:5)], clusters.in.enhancers[,1:2], by=c("clusterID" = "promoterID"))
+rawcounts_enhancers <- rawcounts_enhancers[!duplicated(rawcounts_enhancers),] # shouldn't need to, but just in case
+rawcounts_enhancers <- dplyr::select(rawcounts_enhancers, c('enhancerID', colnames(rawcounts)[-(1:5)])) %>% group_by(enhancerID) %>% summarise_all(sum)
+colnames(rawcounts_enhancers)[1] <- 'clusterID'
+
+# now combine 
+rawcounts <- bind_rows(rawcounts_promoters, rawcounts_enhancers)
+
+# Now, collapse down to mergedName
+rawcounts <- inner_join(annot_G27_full[,c('clusterID','mergedName')], rawcounts, by='clusterID')
+rawcounts <- rawcounts[,-1] %>% group_by(mergedName) %>% summarise_all(sum)
+
+# first, convert rawcounts to matrix for easier handling
+ids <- rawcounts$mergedName
+rawcounts <- as.matrix(rawcounts[,-1])
+rownames(rawcounts) <- ids
+rawcounts <- rawcounts[,sample_info$sample] # keep the sample order consistent
+
+rm(clusters.in.promoters, clusters.in.enhancers, rawcounts_promoters, rawcounts_enhancers, enhancers.F5)
+```
+
+Now that all annotations are set up, we can clean up the annotation tables and remove objects that are no longer needed.
+```{r cleanup_annot_G27}
+# later, to have only 1 annotation per merged CAGE cluster
+# also, remove unused columns
+annot_G27_merged <- dplyr::filter(annot_G27_full, mergedName %in% rownames(rawcounts)) %>%  select(-c('clusterID','clusterName','start','end'))
+annot_G27_merged <- annot_G27_merged[!duplicated(annot_G27_merged$mergedName),]
+annot_G27 <- select(annot_G27_merged, c('mergedName','chrom','mergedStart','mergedEnd','strand','F5_tag_count','type','mask','geneNum','trnscptIDStr','geneIDStr','geneNameStr','geneClassStr','Entrez_ID','HGNC_ID'))
+
+rm(annot_G27_merged)
+```
+
+
+## Visualization functions and variables set up
+
+Assign colours to different sample annotations.
+```{r sample_colors}
+# for plots
+sample_colors <- list()
+
+sample_colors$clone <- brewer.pal(length(levels(sample_info$clone)), 'Dark2')
+names(sample_colors$clone) <- levels(sample_info$clone)
+
+sample_colors$barcode <- brewer.pal(length(unique(sample_info$barcode)), "Set1")
+names(sample_colors$barcode) <- sort(unique(sample_info$barcode))
+
+sample_colors$library.id <- brewer.pal(3, 'Set1')
+names(sample_colors$library.id) <- unique(sample_info$library.id)
+```
+
+For convenience, set up our CAGE expression visualization funcctions.
+```{r gene_expression_plot_functions}
+
+# input = CAGE cluster IDs
+plot_exp_by_ids <- function(ids, bc_logcpm, log=TRUE, info=sample_info, annot=annot_G27, 
+                            nrow=NULL, ncol=NULL)
+{
+  ids_orig <- ids
+  ylab <- 'Expression (log2 cpm)'
+  exptab <- bc_logcpm[,info$sample]
+  if (!log) {
+    exptab <- 2^exptab
+    ylab <- 'Expression (cpm)'
+  }
+  ids <- ids[ids %in% rownames(exptab)]
+
+  if (length(ids) > 0) {
+    exptab <- exptab[ids,]
+    exptab[exptab < -0.5] <- -0.5
+    if (length(ids) == 1) {
+      exptab <- t(as.data.frame(exptab))
+      rownames(exptab) <- ids
+    }
+    ylim <- c(-0.6, ceiling(max(exptab[ids,])))
+    
+      
+    if (is.null(nrow) & is.null(ncol)) {
+      if (length(ids) == 1) {
+        nrow <- 1
+        ncol <- 1
+      } else {
+        ncol <- 2
+      nrow <- ceiling(length(ids) / ncol)
+    }
+  } else if (is.null(nrow)) {
+    nrow <- ceiling(length(ids) / ncol)
+    } else if (is.null(ncol)) {
+      ncol <- ceiling(length(ids) / nrow)
+    } else if (!is.null(nrow) & !is.null(ncol) & nrow * ncol < length(ids)) {
+      ncol <- 2
+      nrow <- ceiling(length(ids) / ncol)
+    }
+    
+    p <- purrr::map(ids, function(id) {
+      pos <- dplyr::filter(annot, mergedName == id)[,c('chrom','mergedStart','mergedEnd','strand')]
+      cID <- paste0(pos$chrom, ':', pos$mergedStart, '-', pos$mergedEnd)
+      cID <- if_else(is.na(pos$strand), cID, paste0(cID, ',', pos$strand))
+      tab <- data.frame(Exp=exptab[id, info$sample], Clone=info$clone)
+      ggplot2::ggplot(tab, aes(x=Clone, y=Exp, color=Clone, fill=Clone)) + 
+        geom_point(size=2, position='identity') + 
+        ylab(label=ylab) + ylim(ylim) + ggtitle(id, subtitle=cID) + 
+        scale_color_manual(values=sample_colors$clone) +
+        theme(axis.text.x = element_text(angle=45), 
+              panel.background = element_rect(fill = "white", colour='black', linetype='solid'),
+              panel.grid.major = element_line(size = 0.5, linetype = 'dotted', colour = "grey"))
+    })
+    #cols <- ifelse(length(p) >= 2, 2, 1)
+    #cowplot::plot_grid(plotlist=p, nrow=nrow, ncol=ncol)
+    gridExtra::grid.arrange(gridExtra::arrangeGrob(grobs=p, nrow=nrow, ncol=ncol))
+    #scater::multiplot(plotlist=p, cols=cols)
+  } else {
+    print("No IDs not found")
+  }
+}
+
+# input = gene names
+plot_exp_by_genes <- function(genes, dge, log=FALSE, info=sample_info, annot=annot_G27, 
+                              colour_by='clone', 
+                              nrow=NULL, ncol=NULL)
+{
+  ylab <- 'Expression (cpm)'
+  exptab <- cpm(dge)[,info$sample]
+  if (log) {
+    exptab <- cpm(dge, log=TRUE, prior.count=2)[,info$sample]
+    ylab <- 'Expression (log2 cpm)'
+  }
+  ids <- dplyr::filter(annot, geneNameStr %in% genes)$mergedName
+  ids <- ids[ids %in% rownames(exptab)]
+
+  if (length(ids) > 0) {
+    exptab <- exptab[ids,]
+    exptab[exptab < -0.5] <- -0.5
+    if (length(ids) == 1) {
+      exptab <- t(as.data.frame(exptab))
+      rownames(exptab) <- ids
+    }
+    ylim <- c(-0.6, ceiling(max(exptab)))
+    if (is.null(nrow) & is.null(ncol)) {
+      if (length(ids) == 1) {
+        nrow <- 1
+        ncol <- 1
+      } else {
+        ncol <- 2
+      nrow <- ceiling(length(ids) / ncol)
+    }
+  } else if (is.null(nrow)) {
+    nrow <- ceiling(length(ids) / ncol)
+    } else if (is.null(ncol)) {
+      ncol <- ceiling(length(ids) / nrow)
+    } else if (!is.null(nrow) & !is.null(ncol) & nrow * ncol < length(ids)) {
+      ncol <- 2
+      nrow <- ceiling(length(ids) / ncol)
+    }
+    
+    
+    p <- purrr::map(ids, function(id) {
+      pos <- dplyr::filter(annot, mergedName == id)[,c('chrom','mergedStart','mergedEnd','strand')]
+      cID <- paste0(pos$chrom, ':', pos$mergedStart, '-', pos$mergedEnd)
+      cID <- if_else(is.na(pos$strand), cID, paste0(cID, ',', pos$strand))
+      tab <- data.frame(Exp=exptab[id,info$sample], Clone=info$clone, Group=info[[colour_by]])
+      ggplot2::ggplot(tab, aes(x=Clone, y=Exp, color=Group, fill=Group)) + 
+        geom_point(size=2, position='identity') + ylab(label=ylab) + ylim(ylim) +  ggtitle(id, subtitle=cID) +
+        scale_color_manual(values=sample_colors$clone) +
+        theme(axis.text.x = element_text(angle=45), 
+              panel.background = element_rect(fill = "white", colour='black', linetype='solid'),
+              panel.grid.major = element_line(size = 0.5, linetype = 'dotted', colour = "grey"))
+    })
+#    cols <- ifelse(length(p) >= 2, 2, 1)
+#    scater::multiplot(plotlist=p, cols=cols)
+    cowplot::plot_grid(plotlist=p, nrow=nrow, ncol=ncol)
+  } else {
+    print("No CAGE clusters found")
+  }
+}
+```
+
+
+# Differential Expression Analysis
+
+Now that the necessary information has been loaded and processed, we can start the differential expression analysis. We will be using edgeR package, with mostly default paramters. We will filter the CAGE clusters for lowly expressed ones, such that each cluster needs to be expressed at 1 CPM or more in at least 3 samples, with CPM > 3 in at least one sample.
+
+```{r setup_DGEList}
+
+# set up DGEList object
+dge <- DGEList(counts=rawcounts, group=sample_info$clone)
+keep_rows <- rowSums(cpm(dge) > 1) >= 3 & rowSums(cpm(dge) >= 3) >= 1
+dge <- dge[keep_rows,]
+dge$samples$lib.size <- colSums(dge$counts)
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge, robust=TRUE, verbose=TRUE)
+
+sample_info <- sample_info[c(1:12,19:24,13:18),]
+
+dge <- dge[,sample_info$sample]
+```
+
+## QC
+
+Preliminary check to see if the libraries have noticeable batch effects.
+```{r plot_raw_MDS, fig.width=10}
+par(mfrow=c(1,2))
+plotMDS(dge, label=colnames(dge), pch=15, cex=0.6, col=sample_colors$clone[sample_info$clone], main="By cell type")
+plotMDS(dge, label=colnames(dge), pch=15, cex=0.6, col=sample_colors$library.id[sample_info$library.id], main="By library")
+```
+
+The samples actually cluster well together already.
+
+Check for outliers by examining the spread of expression values.
+```{r boxplot_raw_expression, fig.width=10, fig.height=8}
+# log2 scale is more useful
+par(mar=c(7,4,4,2), las=3, cex.axis=0.7, cex.lab=0.7)
+boxplot(cpm(dge, log=TRUE), main="Expression by Samples", ylim=c(min(cpm(dge, log=TRUE)), max(cpm(dge, log=TRUE))), ylab='Log2 Expression', col=sample_colors$clone[sample_info$clone])
+```
+
+Finally, we make a BCV plot to check the spread of biologcial coefficient of variation over expression.
+```{r plot_BCV}
+plotBCV(dge)
+```
+
+Overall, there is a good clustering of the replicates even at this stage.
+
+## Model set up
+
+Our major batch effect comes from the library IDs. We should remove this effect when we perform differential expression. 
+```{r model_and_batch_remove}
+# design matrix
+design <- model.matrix(~0 + clone + library.id, data=sample_info)
+rownames(design) <- sample_info$sample
+design <- design[colnames(dge),]
+
+# GLM model fit
+dge <- estimateDisp(dge, design, robust=TRUE, verbose=TRUE)
+```
+
+Let's check the BCV plot again.
+```{r plot_BCV_2}
+# check BCV again
+plotBCV(dge)
+```
+
+There are no unexpected changes. We can go ahead and prepare the normalized, batch-corrected expresison table.
+```{r batch_corrected_expression_table}
+# remove batch
+bc_logcpm <- limma::removeBatchEffect(cpm(dge, log=TRUE, prior.count=2), design=design[,1:8], batch=sample_info$library.id)
+
+tab <- data.frame(bc_logcpm, mergedName=rownames(bc_logcpm), stringsAsFactors=FALSE)
+tab <- dplyr::right_join(annot_G27, tab, by='mergedName')
+write_tsv(tab, file.path(dirs$results, "CRISPR_p53.batch_removed_log2_cpm.txt.gz"))
+```
+
+## CAGE cluster expression checks
+
+Now that we have the normalized expression table, we can perform PCA to how the replicates cluster together, and how key genes related to p53 are expressed in wild type vs. mutant clones.
+
+```{r normalized_PCA}
+
+res_pca <- FactoMineR::PCA(t(bc_logcpm), scale.unit=TRUE, ncp=5, graph=F)
+
+tab <- as_tibble(res_pca$ind$coord[,1:2])
+tab$sample <- sample_info$sample
+tab$clone <- sample_info$clone
+xp <- signif(res_pca$eig[1,2], 4)
+yp <- signif(res_pca$eig[2,2], 4)
+
+#pdf(file=file.path(dirs$plots, "p1_batch_removed_PCA.pdf"), height=5)
+ggplot(tab, aes(x=Dim.1, y=Dim.2, color=clone, fill=clone)) + 
+  geom_point(size=2) + ggrepel::geom_text_repel(label=tab$sample) + 
+  xlab(paste0('Dim 1 (', xp, '%)')) + ylab(paste0('Dim 2 (', yp, '%)')) + 
+  geom_hline(yintercept=0, linetype='dotted') + geom_vline(xintercept=0, linetype='dotted') +
+  theme_bw(base_size=14) + scale_color_manual(values=sample_colors$clone[sample_info$clone])
+#dev.off()
+```
+
+Along with the PCA above, we can also perform hierarchical clustering. 
+
+```{r hierarchical_clustering}
+#pdf(file.path(dirs$plots, "p2_sample_clustering_dendrogram.pdf"))
+plot(hclust(dist(t(bc_logcpm))), xlab='Distance (complete linkage method)', main=NULL)
+#dev.off()
+```
+
+According to the clustering dendrogram, c4.2, c4.8, and c5.11 form the outlier group. This is in agreement with PCA (Dim1+2).
+
+Now, let's examine the expression profiles of key TP53-related genes: MDM2 and CDKN1A.
+```{r dotplot_tp53_mdm2_cdkn1a, fig.width=10, fig.height=4}
+#pdf(file.path(dirs$plots, "TP53_MDM2_CDKN1A.pdf"), width=12, height=4)
+plot_exp_by_ids(c('p1@TP53','p1@MDM2','p4_p1_p2@CDKN1A'), bc_logcpm, nrow=1, ncol=3)
+#dev.off()
+```
+
+We can also examine other marker genes taken from literature.
+```{r dotplot_other_marker_genes, fig.width=10, fig.height=10}
+# some marker genes to look at
+markers <- c('BAX','TIGAR','RPL23','RPS27L','XRCC6','MDM4')
+marker_ids <- dplyr::filter(annot_G27, geneNameStr %in% markers)$mergedName
+marker_ids <- marker_ids[marker_ids %in% rownames(dge)]
+marker_ids <- marker_ids[order(apply(bc_logcpm[marker_ids,], 1, max), decreasing=TRUE)]
+marker_ids <- marker_ids[-c(6,7,8)]
+
+#pdf(file.path(dirs$plots, "p3_markers_dotplot.pdf"), width=10, height=14)
+plot_exp_by_ids(marker_ids[1:5], bc_logcpm, log=FALSE, nrow=3, ncol=2)
+plot_exp_by_ids(marker_ids[6:10], bc_logcpm, log=FALSE, nrow=3, ncol=2)
+#dev.off()
+```
+
+Finally, we look at the expresison levels of ITGAV and ITGB3, the components of integrin avB3.
+```{r dotplot_itgav_itgb3, fig.width=10}
+#pdf(file.path(dirs$plots, "p3b_ITGAV_ITGB3_dotplot.pdf"), width=10, height=5)
+plot_exp_by_ids(c('p2_p1@ITGAV','p2_p1@AC068234.1;ITGB3'), bc_logcpm, log=TRUE, nrow=1, ncol=1)
+#dev.off()
+```
+
+## Differential expression computation
+
+Now we move onto the actual differential expression using edgeR's glmQLFit and the previously built design matrix. The comparisons will focus on each mutant clone vs. the wild type, along with all mutant clones vs. the wild type, and fast-growing clone4.2 vs. other mutant clones (taken from visual inspection). 
+
+```{r fit_GLM}
+#
+# Should I do all by all? Or just against the wild type?
+#
+my_contrasts <- makeContrasts(
+  # against the wild type
+  c3.4.vs.wild_type = clonec3.4 - clonewild_type,
+  c4.2.vs.wild_type = clonec4.2 - clonewild_type,
+  c4.8.vs.wild_type = clonec4.8 - clonewild_type,
+  c5.5.vs.wild_type = clonec5.5 - clonewild_type,
+  c5.9.vs.wild_type = clonec5.9 - clonewild_type,
+  c5.11.vs.wild_type = clonec5.11 - clonewild_type,
+  c5.12.vs.wild_type = clonec5.12 - clonewild_type,
+  all.vs.wild_type = (clonec3.4 + clonec4.2 + clonec4.8 + clonec5.5 + clonec5.9 + clonec5.11 + clonec5.12)/7 - clonewild_type,
+  fast.vs.all = clonec4.2 - (clonec3.4 + clonec4.8 + clonec5.5 + clonec5.9 + clonec5.11 + clonec5.12)/6,
+  levels=design)
+
+# DE calculations
+# 2 methods: GLM and QL
+# QL is more strict
+
+fit <- glmQLFit(dge, design)
+```
+
+We can plot the QL dispersion of the fitted model.
+```{r QL_dispersion}
+plotQLDisp(fit)
+```
+
+Using the fitted model, we will use edgeR's TREAT function to take into account both the log fold change (min. logFC of 0.5) and FDR (max. FDR of 0.05).
+
+```{r compare_TREAT}
+tr <- map(colnames(my_contrasts), function(cont) {
+  glmTreat(fit, contrast=my_contrasts[,cont], lfc=0.5)
+})
+names(tr) <- colnames(my_contrasts)
+
+# individual CAGE clusters 
+DE_tables <- map(tr, function(cont) {
+    topTags(cont, n=Inf, adjust.method='BH', sort.by='PValue', p.value=maxFDR)$table
+})
+
+# for convenience, collapsed down to gene level
+DE_genes <- map(DE_tables, function(tab) {
+  de <- dplyr::filter(annot_G27, mergedName %in% rownames(tab))
+  unique(de$geneNameStr)
+})
+
+all_DE_promoters <- Reduce(union, lapply(DE_tables, rownames))
+table(dplyr::filter(annot_G27, mergedName %in% all_DE_promoters)$geneClassStr)
+```
+
+Save the results.
+```{r save_DiffExp_results, message=FALSE}
+dir.create(file.path(dirs$results, "DiffExp"), showWarnings=FALSE, recursive=TRUE)
+invisible(map(names(DE_tables), function(cont) {
+  tab <- bind_cols(mergedName=rownames(DE_tables[[cont]]), DE_tables[[cont]])
+  if (nrow(tab) > 0) {
+    tab <- dplyr::right_join(annot_G27, tab, by='mergedName')
+    write_tsv(tab, file.path(dirs$results, "DiffExp", paste0(cont, ".tsv")))
+  }
+}))
+```
+
+We can visualize the overall changes in each comparison using smearplots.
+```{r TREAT_smearplots, fig.width=10, fig.height=10, message=FALSE}
+#png(file.path(dirs$plots, "p4_DE_TREAT_smearplots.png"), width=800, height=800)
+par(mfrow=c(3,3))
+invisible(map(names(tr),
+    function(cont) {
+        de.tags <- rownames(topTags(tr[[cont]], p.value=maxFDR, sort.by='PValue', n=Inf)$table)
+        plotSmear(tr[[cont]], de.tags=de.tags, main=cont)
+        abline(h=c(-minLogFC, minLogFC), col='blue')
+    }))
+#dev.off()
+```
+
+We have off-target region predictions from CasOFFinder. Are any of them associated with our differentially expressed genes? To do this, we first extend the predicted regions by 1kb on either side, and overlap them with Gencode gene models. Genes with any overlap with the extended regions will be marked as possible off-target genes. We can now intersect this gene list with our differentially expressed genes and see if any overlap.
+
+```{r offtarget_predicitons}
+offtargets <- read_tsv(file.path(dirs$box, "Cas-OFFinder/Cas-OFFinder_results_mm2_bulge2.bed"), col_names=c('chrom','start','end'))
+
+# to compare off target locations with gene models
+gencode <- read_tsv(file.path(dirs$gencode, "gencode.v27.annotation.gtf.gz"), comment="##", col_names=FALSE)
+colnames(gencode) <- c('chrom','source','biotype','start','end','something1','strand','something2','id_string')
+gencode <- dplyr::filter(gencode, biotype == 'gene')
+
+offtargets_ext1k <- offtargets
+offtargets_ext1k$start_1k <- offtargets_ext1k$start - 1000
+offtargets_ext1k$end_1k <- offtargets_ext1k$end + 1000
+
+# find offtarget overlapping genes
+overlap <- findOverlaps(
+  GRanges(seqnames=offtargets_ext1k$chrom, IRanges(start=offtargets_ext1k$start, end=offtargets_ext1k$end)),
+  GRanges(seqnames=gencode$chrom, IRanges(start=gencode$start, end=gencode$end))
+)
+
+offtarget_genes <- strsplit(gencode[unique(subjectHits(overlap)),]$id_string, split=';')
+offtarget_genes <- unlist(lapply(offtarget_genes, '[[', 3))
+offtarget_genes <- unlist(lapply(strsplit(offtarget_genes, split="\\\""), '[[', 2))
+
+offtargets_ext1k$gene <- NA
+offtargets_ext1k$gene[queryHits(overlap)] <- offtarget_genes
+
+write_tsv(offtargets_ext1k, file.path(dirs$results, "offtargets_1k_ext_genes.tsv"))
+lapply(DE_genes, function(x) {sum(x %in% offtarget_genes)})
+
+# let's keep gencode around just in case
+rm(offtargets, gencode, overlap)
+```
+
+# 4. Functional and Regulatory Analyses
+
+Now that we have the list of differentially expressed genes, we can perform functional analysis and determine if there are any specific GO terms or KEGG functional pathways that are affected. We will also draw upon external ChIP-Atlas data to see if existing ChIP-seq data sets point to p53 disruptino in our results. Finally, we look at whether Motif Activity Response Analysis (MARA) reveal disruption of p53-based regulation, and whether other transcription factors might be in play.
+
+First, we set up the list of genes that are in play.
+```{r set_universe}
+universe <- unique(dplyr::filter(annot_G27, mergedName %in% rownames(dge))$Entrez_ID)
+universe <- unique(Reduce(c, strsplit(universe, split=" ")))
+universe <- universe[!is.na(universe)]
+```
+
+## GO term enrichment
+
+We will be using edgeR's builtin goanna function, with p-value threhsold of 0.05.
+```{r perform_GO}
+go_DE <- map(DE_tables, function(tab) {
+    up <- dplyr::filter(annot_G27, mergedName %in% rownames(tab)[tab$logFC > 0])$Entrez_ID
+    up <- unique(Reduce(c, strsplit(up, split=" ")))
+    up <- up[!is.na(up)]
+    down <- dplyr::filter(annot_G27, mergedName %in% rownames(tab)[tab$logFC < 0])$Entrez_ID
+    down <- unique(Reduce(c, strsplit(down, split=" ")))
+    down <- down[!is.na(down)]
+    up.res <- goana(up, universe=universe, species='Hs')
+    up.res <- up.res[order(up.res$P.DE),]
+    up.res <- up.res[up.res$P.DE < maxFDR,]
+    down.res <- goana(down, universe=universe, species='Hs')
+    down.res <- down.res[order(down.res$P.DE),]
+    down.res <- down.res[down.res$P.DE < maxFDR,]
+    list(up=up.res, down=down.res)
+})
+
+dir.create(file.path(dirs$results, "GO"), showWarnings=FALSE, recursive=TRUE) 
+invisible(map(names(go_DE), function(cont) {
+    res <- go_DE[[cont]]
+    write.table(res$up, file=file.path(dirs$results, "GO", paste0('GO_Up_', cont, '.txt')), sep="\t", quote=FALSE, col.names=TRUE, row.names=TRUE)
+    write.table(res$down, file=file.path(dirs$results, "GO",paste0('GO_Down_', cont, '.txt')), sep="\t", quote=FALSE, col.names=TRUE, row.names=TRUE)
+}))
+```
+
+## KEGG pathway enrichment
+
+Similarly, we use edgeR's kegga function for KEGG pathway enrichment.
+```{r perform_KEGG}
+kegg_DE <- map(DE_tables, function(tab) {
+    up <- dplyr::filter(annot_G27, mergedName %in% rownames(tab)[tab$logFC > 0])$Entrez_ID
+    up <- unique(Reduce(c, strsplit(up, split=" ")))
+    up <- up[!is.na(up)]
+    down <- dplyr::filter(annot_G27, mergedName %in% rownames(tab)[tab$logFC < 0])$Entrez_ID
+    down <- unique(Reduce(c, strsplit(down, split=" ")))
+    down <- down[!is.na(down)]
+    up.res <- kegga(up, universe=universe, species='Hs')
+    up.res <- up.res[order(up.res$P.DE),]
+    #up.res <- up.res[up.res$P.DE < maxFDR,]
+    down.res <- kegga(down, universe=universe, species='Hs')
+    down.res <- down.res[order(down.res$P.DE),]
+    #down.res <- down.res[down.res$P.DE < maxFDR,]
+    list(up=up.res, down=down.res)
+})
+
+dir.create(file.path(dirs$results, "KEGG"), showWarnings=FALSE, recursive=TRUE) 
+invisible(map(names(kegg_DE), function(cont) {
+    res <- kegg_DE[[cont]]
+    write.table(res$up, file=file.path(dirs$results, "KEGG", paste0('KEGG_Up_', cont, '.txt')), sep="\t", quote=FALSE, col.names=TRUE, row.names=TRUE)
+    write.table(res$down, file=file.path(dirs$results, "KEGG", paste0('KEGG_Down_', cont, '.txt')), sep="\t", quote=FALSE, col.names=TRUE, row.names=TRUE)
+}))
+```
+
+KEGG pathways includes the p53 signaling pathway. Let's combine the KEGG results together, using -log of p-values as the scores, and see how the p53 pathway fares in the list of differentially expressed genes.
+```{r KEGG_analysis_p53}
+kegg_all <- list()
+kegg_all$up <- map(kegg_DE, function(cont) {
+  cont$up
+})
+kegg_all$down <- map(kegg_DE, function(cont) {
+  cont$down
+})
+
+kegg_all <- map(kegg_all, function(tabs) {
+  tab <- purrr::reduce(tabs, full_join, by='Pathway')
+  tab <- tab[,c(1,4,7,10,13,16,19,22)]
+  n <- unlist(lapply(strsplit(names(tabs), split="\\.vs\\."), '[[', 1))[1:7]
+  colnames(tab)[2:8] <- n
+  rownames(tab) <- tab$Pathway
+  
+  tab <- as.matrix(tab[,-1])
+  tab <- -log10(tab)
+  tab[is.na(tab)] <- 0
+  
+  tab
+})
+```
+
+To see how p53 pathway is affected across the mutant clones, we can plot the pathway score (as above) in a bar plot.
+```{r barplot_KEGG_p53}
+i <- sort(kegg_all$down[3,]) # p53
+
+#pdf(file.path(dirs$plots, "kegg_all_down_boxplot.pdf"), height=5)
+tab <- tibble(Clone=factor(colnames(kegg_all$down), levels=names(i)), 
+                           Score=kegg_all$down['p53 signaling pathway',])
+ggplot(tab, aes(x=Clone, y=Score, fill=Clone)) + geom_bar(stat="identity", colour='black') + geom_hline(yintercept=-log10(maxFDR), linetype='dotted') + labs(y='-log10 (p-value)') + scale_fill_manual(values=sample_colors$clone[2:8]) + theme_bw(base_size=14) + ggtitle("KEGG p53 Signaling Pathway")
+#dev.off()
+```
+
+We can also produce heatmaps for the top pathways (limited to 10 for readability).
+```{r KEGG_heatmap}
+i <- map(kegg_all, function(tab) {
+  order(apply(tab, 1, median), decreasing=TRUE)
+})
+
+#pdf(file.path(dirs$plots, "kegg_all_heatmap.pdf"), width=10)
+pheatmap::pheatmap(kegg_all$up[i$up[1:10],], fontsize=10)
+pheatmap::pheatmap(kegg_all$down[i$down[1:10],], fontsize=10)
+#dev.off()
+```
+
+
+## ChIP-Atlas
+
+We have collected the data from ChIP-atlas, and separately produced scores based on the CAGE expression data and the ChIP binding values of the genes. If we filter for TP53, what do we see.mean log2 fold change of expression for genes with TP53 binding at the promoters.
+
+We can visualize the mean expression logFC of genes with TP53 ChIP-seq evidence across the mutant clones.
+
+```{r ChIP-atlas}
+chip_atlas <- read_csv(file.path(dirs$box, "Bogu/chip_atlas_act.csv.zip"))
+
+p53mat <- chip_atlas %>% dplyr::filter(grepl('P53', X1))
+mat <- as.matrix(p53mat[,-1])
+rownames(mat) <- p53mat$X1
+p53mat <- bind_cols(clone=sample_info$clone, as_tibble(t(mat))) %>% group_by(clone) %>% summarise_all(funs(mean))
+mat <- as.matrix(p53mat[,-1])
+rownames(mat) <- p53mat$clone
+mat <- t(mat)
+mat <- mat[,2:ncol(mat)] - mat[,1]
+mat <- reshape2::melt(mat, value.name='logFC')
+colnames(mat) <- c('Source','Clone','logFC')
+
+#pdf(file.path(dirs$plots, "TP53_chip_atlas_boxplot.pdf"), height=5)
+ggplot(mat, aes(x=Clone, y=logFC, fill=Clone)) + geom_boxplot(width=0.5, colour='black') + labs(y='Mean expression logFC') + theme_bw(base_size=14) + geom_hline(yintercept=0, linetype='dotted') + scale_fill_manual(values=sample_colors$clone[2:8]) + ggtitle("TP53 ChIP-Seq Data Sets")
+#dev.off()
+
+rm(p53mat, mat)
+```
+
+## Motif Activity Response Analysis
+
+Motif Activity Response Analysis combines the transcription factor binding site motifs in the promoters and the expression levels from those promoters to calculate the motif activities. We can examine how the motif activity of TP53 is affected across mutant clones. We will focus on those motifs with Z scores > 2.
+```{r MARA}
+mara <- as.matrix(read.delim(file.path(dirs$box, "MARA/CRISPR_p53_promoters.motif_activities.txt"), header=TRUE, sep="\t", row.names=1, check.names=FALSE))
+n <- c(paste0(rep('WT_rep', 3), 1:3), paste0(rep('c3.4_rep', 3), 1:3),
+       paste0(rep('c4.8_rep', 3), 1:3), paste0(rep('c4.2_rep', 3), 1:3),
+       paste0(rep('c5.11_rep', 3), 1:3), paste0(rep('c5.12_rep', 3), 1:3),
+       paste0(rep('c5.9_rep', 3), 1:3), paste0(rep('c5.5_rep', 3), 1:3))
+colnames(mara) <- c(n, paste0(n, '.stddev'), 'zvalue')
+
+UFEwm <- which(rownames(mara) == 'UFEwm')
+mara_act <- as.matrix(mara[-UFEwm,1:24])
+mara_sd <- as.matrix(mara[-UFEwm,25:(ncol(mara)-1)])
+mara_z <- scale(mara_act / mara_sd)
+mara_z <- mara_z[,sample_info$sample]
+motif_z <- sort(sqrt(1/ncol(mara_z) * apply(mara_z * mara_z, 1, sum)), decreasing=TRUE)
+
+# which ones are significant?
+# by overall zvalue ranking
+z_threshold <- 2
+sig_motifs <- rownames(mara)[mara[,'zvalue'] > z_threshold]
+sig_motifs <- sig_motifs[-UFEwm]
+
+tab <- apply(mara_z, 1, function(x) {
+  tapply(x, sample_info$clone, median)
+})
+tab <- t(tab)
+tab <- tibble(Clone=factor(colnames(tab), levels=colnames(tab)), Zscore=tab['TP53',])
+
+#pdf(file=file.path(dirs$plots, "TP53_MARA_Z.pdf"), height=5)
+ggplot(tab, aes(x=Clone, y=Zscore, fill=Clone)) + geom_bar(stat="identity", colour='black') + geom_hline(yintercept=0, linetype='dotted') + labs(y='Motif Activity Z Score') + scale_fill_manual(values=sample_colors$clone) + theme_bw(base_size=14) + ggtitle("TP53 Motif Activity")
+#dev.off()
+```
+
+Ideally, we want mutant clones where we see disruptions in TP53 regulation only, with minimal changes in other transcription factor-mediated regulation. If we remove the TP53 motif activity and sum the rest, we can rank from low to high and see how the clones rank.
+
+```{r MARA_cumulative}
+mat <- bind_cols(clone=sample_info$clone, as_tibble(t(mara_z))) %>% group_by(clone) %>% summarise_all(median)
+mat2 <- as.matrix(mat[,-1])
+rownames(mat2) <- mat$clone
+mat <- t(mat2)
+mat <- mat[sig_motifs, 2:ncol(mat)] - mat[sig_motifs, 1]
+
+# want to rank in the order of least deviation from wild type
+# right now, the scores are the difference of z scores from the wild type
+# take the absolute value, and look for the smallest
+sort(colSums(abs(mat[1:12,])))
+
+ranking <- sort(colSums(abs(mat[1:12,])))
+ranking <- tibble(clone=factor(names(ranking), levels=names(ranking)), score=ranking)
+
+#pdf(file=file.path(dirs$plots, "MARA_overall_ranks.pdf"), height=5)
+ggplot(ranking, aes(x=clone, y=score, fill=clone)) + geom_bar(stat='identity', colour='black') + theme_bw(base_size=14) + scale_fill_manual(values=sample_colors$clone) + ggtitle("Cumulative significant motif activity changes")
+#dev.off()
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
